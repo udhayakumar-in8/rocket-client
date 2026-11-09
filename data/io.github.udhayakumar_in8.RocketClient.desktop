@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Rocket Client
+Comment=Minimal Rocket.Chat messaging client
+Exec=rocket-client
+Icon=io.github.udhayakumar_in8.RocketClient
+Terminal=false
+Type=Application
+Categories=GNOME;GTK;Network;Chat;InstantMessaging;
+Keywords=rocket;chat;messaging;im;
+StartupNotify=true
+DBusActivatable=false

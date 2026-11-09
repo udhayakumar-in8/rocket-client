@@ -1,0 +1,9 @@
+#!/usr/bin/make -f
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@ --buildsystem=meson
+
+# unit tests need no network but some build chroots block even loopback
+override_dh_auto_test:
+	-dh_auto_test

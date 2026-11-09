@@ -1,0 +1,24 @@
+Source: rocket-client
+Section: net
+Priority: optional
+Maintainer: Udhayakumar <udhayazm1@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               meson,
+               ninja-build,
+               pkgconf,
+               libgtk-4-dev,
+               libadwaita-1-dev,
+               libsoup-3.0-dev,
+               libjson-glib-dev
+Standards-Version: 4.7.0
+Homepage: https://github.com/udhayakumar-in8/rocket-client
+Rules-Requires-Root: no
+
+Package: rocket-client
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: glib-networking
+Description: minimal Rocket.Chat messaging client
+ A small GTK 4 / libadwaita client for Rocket.Chat servers, written in C.
+ It connects over HTTPS (port 443) or plain HTTP (port 80) and receives
+ messages in real time over the Rocket.Chat WebSocket (DDP) API.

@@ -1,0 +1,41 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  debian-forky:
+    runs-on: ubuntu-latest
+    container: debian:forky
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential meson ninja-build pkgconf git ca-certificates \
+            libgtk-4-dev libadwaita-1-dev libsoup-3.0-dev libjson-glib-dev \
+            debhelper devscripts
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          meson setup build --buildtype=release
+          meson compile -C build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+      - name: Build .deb package
+        run: |
+          dpkg-buildpackage -us -uc -b
+          mkdir -p dist && mv ../rocket-client_*.deb dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rocket-client-debian-forky
+          path: |
+            build/rocket-client
+            dist/*.deb
