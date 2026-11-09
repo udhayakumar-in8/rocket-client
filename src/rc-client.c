@@ -6,7 +6,7 @@
 #include <libsoup/soup.h>
 
 #define RECONNECT_SECONDS 5
-#define USER_AGENT "rocket-client/0.1"
+#define USER_AGENT "rocket-client/0.2"
 
 struct _RcClient {
   SoupSession  *session;
@@ -18,14 +18,24 @@ struct _RcClient {
   char         *user_id;
   char         *token;
 
+  /* certificate pinning */
+  char                 *trust_file;
+  GHashTable           *pins;           /* "host:port" -> "AB:CD:…" */
+  GTlsCertificate      *rejected_cert;
+  GTlsCertificateFlags  rejected_errors;
+  char                 *rejected_host;
+
   /* realtime */
   RcRealtimeFunc          rt_func;
   gpointer                rt_data;
   gboolean                rt_wanted;
+  gboolean                rt_ready;
   GCancellable           *rt_cancellable;
   SoupWebsocketConnection *ws;
   guint                   rt_reconnect_id;
   guint                   rt_next_id;
+  char                   *rt_room;       /* watched room */
+  GPtrArray              *rt_room_subs;  /* sub ids for rt_room */
 };
 
 G_DEFINE_QUARK (rc-client-error-quark, rc_client_error)
@@ -45,10 +55,12 @@ rc_client_new (void)
   RcClient *self = g_rc_box_new0 (RcClient);
 
   self->session = soup_session_new_with_options ("user-agent", USER_AGENT,
-                                                 "timeout", 30,
+                                                 "timeout", 60,
                                                  NULL);
   self->cancellable = g_cancellable_new ();
   self->candidates = g_ptr_array_new_with_free_func (g_free);
+  self->pins = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+  self->rt_room_subs = g_ptr_array_new_with_free_func (g_free);
   return self;
 }
 
@@ -68,6 +80,12 @@ rc_client_clear (RcClient *self)
   g_clear_pointer (&self->base_url, g_free);
   g_clear_pointer (&self->user_id, g_free);
   g_clear_pointer (&self->token, g_free);
+  g_clear_pointer (&self->trust_file, g_free);
+  g_clear_pointer (&self->pins, g_hash_table_unref);
+  g_clear_object (&self->rejected_cert);
+  g_clear_pointer (&self->rejected_host, g_free);
+  g_clear_pointer (&self->rt_room, g_free);
+  g_clear_pointer (&self->rt_room_subs, g_ptr_array_unref);
 }
 
 void
@@ -127,13 +145,13 @@ normalize_base (const char *url, GError **error)
   /* rebuild without query/fragment; keep only a non-default port */
   {
     int port = g_uri_get_port (uri);
+    g_autoptr(GUri) clean = NULL;
+
     if ((port == 443 && g_ascii_strcasecmp (scheme, "https") == 0) ||
         (port == 80 && g_ascii_strcasecmp (scheme, "http") == 0))
       port = -1;
-    g_autoptr(GUri) clean = g_uri_build (G_URI_FLAGS_NONE,
-                                         scheme, NULL,
-                                         g_uri_get_host (uri),
-                                         port, path, NULL, NULL);
+    clean = g_uri_build (G_URI_FLAGS_NONE, scheme, NULL, g_uri_get_host (uri),
+                         port, path, NULL, NULL);
     s = g_uri_to_string (clean);
   }
   return g_steal_pointer (&s);
@@ -226,6 +244,156 @@ rc_client_get_token (RcClient *self)
 }
 
 /* ------------------------------------------------------------------------ */
+/* certificate trust                                                         */
+
+char *
+rc_cert_fingerprint (GTlsCertificate *cert)
+{
+  g_autoptr(GByteArray) der = NULL;
+  g_autofree char *hex = NULL;
+  GString *out;
+
+  g_object_get (cert, "certificate", &der, NULL);
+  if (der == NULL)
+    return g_strdup ("");
+  hex = g_compute_checksum_for_data (G_CHECKSUM_SHA256, der->data, der->len);
+  out = g_string_new (NULL);
+  for (gsize i = 0; hex[i]; i += 2)
+    {
+      if (i)
+        g_string_append_c (out, ':');
+      g_string_append_c (out, g_ascii_toupper (hex[i]));
+      g_string_append_c (out, g_ascii_toupper (hex[i + 1]));
+    }
+  return g_string_free (out, FALSE);
+}
+
+char *
+rc_cert_describe_errors (GTlsCertificateFlags errors)
+{
+  GString *s = g_string_new (NULL);
+
+#define ADD(flag, text) if (errors & (flag)) g_string_append_printf (s, "%s• %s", s->len ? "\n" : "", text)
+  ADD (G_TLS_CERTIFICATE_UNKNOWN_CA, "Not signed by a trusted authority (self-signed or private CA)");
+  ADD (G_TLS_CERTIFICATE_BAD_IDENTITY, "Issued for a different host name / IP address");
+  ADD (G_TLS_CERTIFICATE_NOT_ACTIVATED, "Not valid yet");
+  ADD (G_TLS_CERTIFICATE_EXPIRED, "Expired");
+  ADD (G_TLS_CERTIFICATE_REVOKED, "Revoked");
+  ADD (G_TLS_CERTIFICATE_INSECURE, "Uses an insecure algorithm");
+  ADD (G_TLS_CERTIFICATE_GENERIC_ERROR, "Could not be validated");
+#undef ADD
+  if (s->len == 0)
+    g_string_append (s, "• Not trusted");
+  return g_string_free (s, FALSE);
+}
+
+static char *
+host_key (GUri *uri)
+{
+  int port = g_uri_get_port (uri);
+
+  if (port <= 0)
+    port = g_ascii_strcasecmp (g_uri_get_scheme (uri), "https") == 0 ||
+           g_ascii_strcasecmp (g_uri_get_scheme (uri), "wss") == 0 ? 443 : 80;
+  return g_strdup_printf ("%s:%d", g_uri_get_host (uri), port);
+}
+
+void
+rc_client_set_trust_file (RcClient   *self,
+                          const char *path)
+{
+  g_autoptr(GKeyFile) kf = g_key_file_new ();
+  g_auto(GStrv) keys = NULL;
+
+  g_free (self->trust_file);
+  self->trust_file = g_strdup (path);
+  g_hash_table_remove_all (self->pins);
+
+  if (!g_key_file_load_from_file (kf, path, G_KEY_FILE_NONE, NULL))
+    return;
+  keys = g_key_file_get_keys (kf, "pins", NULL, NULL);
+  for (guint i = 0; keys && keys[i]; i++)
+    g_hash_table_insert (self->pins, g_strdup (keys[i]),
+                         g_key_file_get_string (kf, "pins", keys[i], NULL));
+}
+
+GTlsCertificate *
+rc_client_get_rejected_certificate (RcClient             *self,
+                                    const char          **host,
+                                    GTlsCertificateFlags *errors)
+{
+  if (host)
+    *host = self->rejected_host;
+  if (errors)
+    *errors = self->rejected_errors;
+  return self->rejected_cert;
+}
+
+void
+rc_client_trust_rejected_certificate (RcClient *self)
+{
+  g_autoptr(GKeyFile) kf = g_key_file_new ();
+  g_autofree char *fp = NULL;
+  g_autofree char *dir = NULL;
+
+  if (self->rejected_cert == NULL || self->rejected_host == NULL)
+    return;
+
+  fp = rc_cert_fingerprint (self->rejected_cert);
+  g_hash_table_insert (self->pins, g_strdup (self->rejected_host), g_strdup (fp));
+
+  if (self->trust_file)
+    {
+      g_key_file_load_from_file (kf, self->trust_file, G_KEY_FILE_KEEP_COMMENTS, NULL);
+      g_key_file_set_string (kf, "pins", self->rejected_host, fp);
+      dir = g_path_get_dirname (self->trust_file);
+      g_mkdir_with_parents (dir, 0700);
+      g_key_file_save_to_file (kf, self->trust_file, NULL);
+    }
+  g_clear_object (&self->rejected_cert);
+  g_clear_pointer (&self->rejected_host, g_free);
+}
+
+static gboolean
+on_accept_certificate (SoupMessage          *msg,
+                       GTlsCertificate      *cert,
+                       GTlsCertificateFlags  errors,
+                       gpointer              data)
+{
+  RcClient *self = data;
+  g_autofree char *key = host_key (soup_message_get_uri (msg));
+  g_autofree char *fp = rc_cert_fingerprint (cert);
+  const char *pinned = g_hash_table_lookup (self->pins, key);
+
+  if (pinned && g_str_equal (pinned, fp))
+    return TRUE;
+
+  g_set_object (&self->rejected_cert, cert);
+  self->rejected_errors = errors;
+  g_free (self->rejected_host);
+  self->rejected_host = g_steal_pointer (&key);
+  return FALSE;
+}
+
+/* turn soup's TLS failure into RC_CLIENT_ERROR_UNTRUSTED_CERT */
+static void
+map_tls_error (RcClient    *self,
+               SoupMessage *msg,
+               GError     **error)
+{
+  g_autofree char *key = NULL;
+
+  if (*error == NULL || (*error)->domain != G_TLS_ERROR || self->rejected_cert == NULL)
+    return;
+  key = host_key (soup_message_get_uri (msg));
+  if (g_strcmp0 (key, self->rejected_host) != 0)
+    return;
+  g_clear_error (error);
+  g_set_error (error, RC_CLIENT_ERROR, RC_CLIENT_ERROR_UNTRUSTED_CERT,
+               "The TLS certificate of %s is not trusted", key);
+}
+
+/* ------------------------------------------------------------------------ */
 /* HTTP                                                                      */
 
 typedef struct {
@@ -240,10 +408,27 @@ typedef struct {
 static void
 request_free (Request *r)
 {
+  if (r->msg)
+    g_signal_handlers_disconnect_by_data (r->msg, r->client);
   g_clear_object (&r->msg);
   g_clear_object (&r->cancellable);
   rc_client_unref (r->client);
   g_free (r);
+}
+
+static void
+prepare_message (RcClient    *self,
+                 SoupMessage *msg,
+                 gboolean     with_auth)
+{
+  SoupMessageHeaders *h = soup_message_get_request_headers (msg);
+
+  if (with_auth && self->user_id && self->token)
+    {
+      soup_message_headers_replace (h, "X-User-Id", self->user_id);
+      soup_message_headers_replace (h, "X-Auth-Token", self->token);
+    }
+  g_signal_connect (msg, "accept-certificate", G_CALLBACK (on_accept_certificate), self);
 }
 
 static SoupMessage *
@@ -255,27 +440,18 @@ build_message (RcClient   *self,
 {
   g_autofree char *url = g_strconcat (base, path, NULL);
   SoupMessage *msg = soup_message_new (method, url);
-  SoupMessageHeaders *h;
 
   if (msg == NULL)
     return NULL;
 
-  h = soup_message_get_request_headers (msg);
-  soup_message_headers_append (h, "Accept", "application/json");
-  if (self->user_id && self->token)
-    {
-      soup_message_headers_append (h, "X-User-Id", self->user_id);
-      soup_message_headers_append (h, "X-Auth-Token", self->token);
-    }
+  soup_message_headers_append (soup_message_get_request_headers (msg), "Accept", "application/json");
+  prepare_message (self, msg, TRUE);
 
   if (body)
     {
-      gsize len = 0;
       char *data = json_to_string (body, FALSE);
-      g_autoptr(GBytes) bytes = NULL;
-
-      len = strlen (data);
-      bytes = g_bytes_new_take (data, len);
+      gsize len = strlen (data);
+      g_autoptr(GBytes) bytes = g_bytes_new_take (data, len);
       soup_message_set_request_body_from_bytes (msg, "application/json", bytes);
     }
 
@@ -294,6 +470,8 @@ parse_response (SoupMessage *msg,
   JsonNode *root;
   JsonObject *obj;
   gboolean ok_status = SOUP_STATUS_IS_SUCCESSFUL (status);
+  int code = status == 401 ? RC_CLIENT_ERROR_AUTH :
+             status == 404 ? RC_CLIENT_ERROR_NOT_FOUND : RC_CLIENT_ERROR_API;
 
   if (len == 0 || !json_parser_load_from_data (parser, data, len, NULL) ||
       (root = json_parser_get_root (parser)) == NULL ||
@@ -301,7 +479,7 @@ parse_response (SoupMessage *msg,
     {
       if (!ok_status)
         g_set_error (error, RC_CLIENT_ERROR,
-                     status == 401 ? RC_CLIENT_ERROR_AUTH : RC_CLIENT_ERROR_HTTP,
+                     code == RC_CLIENT_ERROR_API ? RC_CLIENT_ERROR_HTTP : code,
                      "HTTP %u %s", status,
                      soup_message_get_reason_phrase (msg) ? soup_message_get_reason_phrase (msg) : "");
       else
@@ -321,9 +499,7 @@ parse_response (SoupMessage *msg,
         m = json_object_get_string_member_with_default (obj, "message", NULL);
       if (m == NULL || *m == '\0')
         m = json_object_get_string_member_with_default (obj, "reason", NULL);
-      g_set_error (error, RC_CLIENT_ERROR,
-                   status == 401 ? RC_CLIENT_ERROR_AUTH : RC_CLIENT_ERROR_API,
-                   "%s", m ? m : "Request failed");
+      g_set_error (error, RC_CLIENT_ERROR, code, "%s", m ? m : "Request failed");
       return NULL;
     }
 
@@ -349,9 +525,39 @@ on_json_sent (GObject      *source,
     }
   else if (error == NULL)
     obj = parse_response (r->msg, bytes, &error);
+  else
+    map_tls_error (r->client, r->msg, &error);
 
   r->func (r->client, obj, error, r->user_data);
   request_free (r);
+}
+
+static void
+send_message (RcClient      *self,
+              SoupMessage   *msg,
+              RcResponseFunc func,
+              gpointer       user_data)
+{
+  Request *r = g_new0 (Request, 1);
+
+  r->client = rc_client_ref (self);
+  r->cancellable = g_object_ref (self->cancellable);
+  r->msg = msg;
+  r->func = func;
+  r->user_data = user_data;
+  soup_session_send_and_read_async (self->session, msg, G_PRIORITY_DEFAULT,
+                                    r->cancellable, on_json_sent, r);
+}
+
+static void
+fail_now (RcClient      *self,
+          const char    *what,
+          RcResponseFunc func,
+          gpointer       user_data)
+{
+  g_autoptr(GError) error = g_error_new (RC_CLIENT_ERROR, RC_CLIENT_ERROR_INVALID_URL,
+                                         "Invalid request URL for %s", what);
+  func (self, NULL, error, user_data);
 }
 
 static void
@@ -362,30 +568,14 @@ send_json (RcClient      *self,
            RcResponseFunc func,
            gpointer       user_data)
 {
-  Request *r;
-  SoupMessage *msg;
+  SoupMessage *msg = self->base_url ? build_message (self, method, self->base_url, path, body) : NULL;
 
-  msg = self->base_url ? build_message (self, method, self->base_url, path, body) : NULL;
   if (body)
     json_node_unref (body);
-
   if (msg == NULL)
-    {
-      g_autoptr(GError) error = g_error_new (RC_CLIENT_ERROR, RC_CLIENT_ERROR_INVALID_URL,
-                                             "Invalid request URL for %s", path);
-      func (self, NULL, error, user_data);
-      return;
-    }
-
-  r = g_new0 (Request, 1);
-  r->client = rc_client_ref (self);
-  r->cancellable = g_object_ref (self->cancellable);
-  r->msg = msg;
-  r->func = func;
-  r->user_data = user_data;
-
-  soup_session_send_and_read_async (self->session, msg, G_PRIORITY_DEFAULT,
-                                    r->cancellable, on_json_sent, r);
+    fail_now (self, path, func, user_data);
+  else
+    send_message (self, msg, func, user_data);
 }
 
 void
@@ -412,6 +602,45 @@ rc_client_post (RcClient      *self,
   send_json (self, "POST", path, body, func, user_data);
 }
 
+void
+rc_client_upload (RcClient           *self,
+                  const char         *path,
+                  const char         *filename,
+                  const char         *content_type,
+                  GBytes             *data,
+                  const char * const *fields,
+                  RcResponseFunc      func,
+                  gpointer            user_data)
+{
+  g_autoptr(SoupMultipart) mp = soup_multipart_new (SOUP_FORM_MIME_TYPE_MULTIPART);
+  g_autofree char *url = NULL;
+  SoupMessage *msg;
+
+  if (self->base_url == NULL)
+    {
+      fail_now (self, path, func, user_data);
+      return;
+    }
+
+  soup_multipart_append_form_file (mp, "file", filename,
+                                   content_type ? content_type : "application/octet-stream",
+                                   data);
+  for (guint i = 0; fields && fields[i] && fields[i + 1]; i += 2)
+    if (*fields[i + 1])
+      soup_multipart_append_form_string (mp, fields[i], fields[i + 1]);
+
+  url = g_strconcat (self->base_url, path, NULL);
+  msg = soup_message_new_from_multipart (url, mp);
+  if (msg == NULL)
+    {
+      fail_now (self, path, func, user_data);
+      return;
+    }
+  soup_message_headers_append (soup_message_get_request_headers (msg), "Accept", "application/json");
+  prepare_message (self, msg, TRUE);
+  send_message (self, msg, func, user_data);
+}
+
 static void
 on_bytes_sent (GObject      *source,
                GAsyncResult *res,
@@ -420,6 +649,7 @@ on_bytes_sent (GObject      *source,
   Request *r = data;
   g_autoptr(GError) error = NULL;
   g_autoptr(GBytes) bytes = NULL;
+  const char *ctype = NULL;
 
   bytes = soup_session_send_and_read_finish (SOUP_SESSION (source), res, &error);
 
@@ -435,8 +665,12 @@ on_bytes_sent (GObject      *source,
       g_set_error (&error, RC_CLIENT_ERROR, RC_CLIENT_ERROR_HTTP, "HTTP %u",
                    soup_message_get_status (r->msg));
     }
+  else if (error)
+    map_tls_error (r->client, r->msg, &error);
+  else
+    ctype = soup_message_headers_get_content_type (soup_message_get_response_headers (r->msg), NULL);
 
-  r->bytes_func (r->client, bytes, error, r->user_data);
+  r->bytes_func (r->client, bytes, ctype, error, r->user_data);
   request_free (r);
 }
 
@@ -447,16 +681,28 @@ rc_client_fetch_bytes (RcClient    *self,
                        gpointer     user_data)
 {
   Request *r;
-  SoupMessage *msg = self->base_url ? build_message (self, "GET", self->base_url, path, NULL) : NULL;
+  SoupMessage *msg = NULL;
+  gboolean own_server = TRUE;
+
+  if (path && strstr (path, "://"))
+    {
+      msg = soup_message_new ("GET", path);
+      own_server = self->base_url && g_str_has_prefix (path, self->base_url);
+    }
+  else if (self->base_url && path)
+    {
+      g_autofree char *url = g_strconcat (self->base_url, path, NULL);
+      msg = soup_message_new ("GET", url);
+    }
 
   if (msg == NULL)
     {
       g_autoptr(GError) error = g_error_new_literal (RC_CLIENT_ERROR, RC_CLIENT_ERROR_INVALID_URL,
                                                      "Invalid URL");
-      func (self, NULL, error, user_data);
+      func (self, NULL, NULL, error, user_data);
       return;
     }
-  soup_message_headers_replace (soup_message_get_request_headers (msg), "Accept", "image/*");
+  prepare_message (self, msg, own_server);
 
   r = g_new0 (Request, 1);
   r->client = rc_client_ref (self);
@@ -503,9 +749,18 @@ login_free (Login *l)
 static const char *
 describe_base (const char *base)
 {
-  if (g_str_has_prefix (base, "https://"))
-    return "HTTPS";
-  return "HTTP";
+  return g_str_has_prefix (base, "https://") ? "HTTPS" : "HTTP";
+}
+
+static gboolean
+is_final_error (const GError *error)
+{
+  /* A real Rocket.Chat answer (wrong password, 2FA…) or a certificate the
+   * user may want to trust: never silently fall back to plain HTTP. */
+  return error->domain == RC_CLIENT_ERROR &&
+         (error->code == RC_CLIENT_ERROR_API ||
+          error->code == RC_CLIENT_ERROR_AUTH ||
+          error->code == RC_CLIENT_ERROR_UNTRUSTED_CERT);
 }
 
 static void
@@ -545,17 +800,11 @@ on_login_reply (RcClient     *client,
       return;
     }
 
-  /* A real Rocket.Chat answer (wrong password, 2FA needed…) – do not fall
-   * back to another port, report it straight away. */
-  if (g_error_matches (error, RC_CLIENT_ERROR, RC_CLIENT_ERROR_API) ||
-      g_error_matches (error, RC_CLIENT_ERROR, RC_CLIENT_ERROR_AUTH) ||
-      l->index + 1 >= client->candidates->len)
+  if (is_final_error (error) || l->index + 1 >= client->candidates->len)
     {
       g_autoptr(GError) e = NULL;
 
-      if (l->errors->len > 0 &&
-          !g_error_matches (error, RC_CLIENT_ERROR, RC_CLIENT_ERROR_API) &&
-          !g_error_matches (error, RC_CLIENT_ERROR, RC_CLIENT_ERROR_AUTH))
+      if (l->errors->len > 0 && !is_final_error (error))
         {
           g_string_append_printf (l->errors, "\n%s: %s", describe_base (tried), error->message);
           e = g_error_new (error->domain, error->code, "%s", l->errors->str);
@@ -637,7 +886,7 @@ rt_emit (RcClient   *self,
 }
 
 static void
-rt_send (RcClient   *self,
+rt_send (RcClient    *self,
          JsonBuilder *b)
 {
   g_autoptr(JsonNode) root = json_builder_get_root (b);
@@ -659,13 +908,13 @@ rt_send_simple (RcClient   *self,
   rt_send (self, b);
 }
 
-static void
+static char *
 rt_subscribe (RcClient   *self,
               const char *name,
               const char *param)
 {
   g_autoptr(JsonBuilder) b = json_builder_new ();
-  g_autofree char *id = g_strdup_printf ("sub-%u", ++self->rt_next_id);
+  char *id = g_strdup_printf ("sub-%u", ++self->rt_next_id);
 
   json_builder_begin_object (b);
   json_builder_set_member_name (b, "msg");
@@ -681,6 +930,140 @@ rt_subscribe (RcClient   *self,
   json_builder_end_array (b);
   json_builder_end_object (b);
   rt_send (self, b);
+  return id;
+}
+
+static void
+rt_unsubscribe (RcClient   *self,
+                const char *id)
+{
+  g_autoptr(JsonBuilder) b = json_builder_new ();
+
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "msg");
+  json_builder_add_string_value (b, "unsub");
+  json_builder_set_member_name (b, "id");
+  json_builder_add_string_value (b, id);
+  json_builder_end_object (b);
+  rt_send (self, b);
+}
+
+static void
+rt_subscribe_room (RcClient *self)
+{
+  static const char *events[] = { "deleteMessage", "user-activity", "typing", "messagesRead" };
+
+  if (!self->rt_ready || self->rt_room == NULL)
+    return;
+  for (guint i = 0; i < G_N_ELEMENTS (events); i++)
+    {
+      g_autofree char *ev = g_strdup_printf ("%s/%s", self->rt_room, events[i]);
+      g_ptr_array_add (self->rt_room_subs, rt_subscribe (self, "stream-notify-room", ev));
+    }
+}
+
+void
+rc_client_realtime_watch_room (RcClient   *self,
+                               const char *rid)
+{
+  if (g_strcmp0 (rid, self->rt_room) == 0)
+    return;
+  for (guint i = 0; i < self->rt_room_subs->len; i++)
+    rt_unsubscribe (self, g_ptr_array_index (self->rt_room_subs, i));
+  g_ptr_array_set_size (self->rt_room_subs, 0);
+  g_free (self->rt_room);
+  self->rt_room = g_strdup (rid);
+  rt_subscribe_room (self);
+}
+
+void
+rc_client_realtime_typing (RcClient   *self,
+                           const char *rid,
+                           const char *username,
+                           gboolean    typing)
+{
+  g_autoptr(JsonBuilder) b = json_builder_new ();
+  g_autofree char *ev = g_strdup_printf ("%s/user-activity", rid);
+  g_autofree char *id = g_strdup_printf ("typing-%u", ++self->rt_next_id);
+
+  if (!self->rt_ready || !rid || !username)
+    return;
+
+  json_builder_begin_object (b);
+  json_builder_set_member_name (b, "msg");
+  json_builder_add_string_value (b, "method");
+  json_builder_set_member_name (b, "method");
+  json_builder_add_string_value (b, "stream-notify-room");
+  json_builder_set_member_name (b, "id");
+  json_builder_add_string_value (b, id);
+  json_builder_set_member_name (b, "params");
+  json_builder_begin_array (b);
+  json_builder_add_string_value (b, ev);
+  json_builder_add_string_value (b, username);
+  json_builder_begin_array (b);
+  if (typing)
+    json_builder_add_string_value (b, "user-typing");
+  json_builder_end_array (b);
+  json_builder_begin_object (b);
+  json_builder_end_object (b);
+  json_builder_end_array (b);
+  json_builder_end_object (b);
+  rt_send (self, b);
+}
+
+static void
+rt_handle_room_event (RcClient   *self,
+                      const char *event_name,
+                      JsonArray  *args)
+{
+  const char *slash = strrchr (event_name, '/');
+  g_autofree char *rid = NULL;
+  g_autoptr(JsonObject) p = json_object_new ();
+  const char *kind;
+  JsonNode *a0 = json_array_get_length (args) > 0 ? json_array_get_element (args, 0) : NULL;
+  JsonNode *a1 = json_array_get_length (args) > 1 ? json_array_get_element (args, 1) : NULL;
+
+  if (slash == NULL)
+    return;
+  rid = g_strndup (event_name, slash - event_name);
+  kind = slash + 1;
+  json_object_set_string_member (p, "rid", rid);
+
+  if (g_str_equal (kind, "deleteMessage"))
+    {
+      if (a0 && JSON_NODE_HOLDS_OBJECT (a0))
+        {
+          const char *id = json_object_get_string_member_with_default (json_node_get_object (a0), "_id", NULL);
+          if (id)
+            {
+              json_object_set_string_member (p, "_id", id);
+              rt_emit (self, "deleted", p);
+            }
+        }
+    }
+  else if (g_str_equal (kind, "user-activity") || g_str_equal (kind, "typing"))
+    {
+      gboolean typing = FALSE;
+
+      if (!a0 || !JSON_NODE_HOLDS_VALUE (a0) || json_node_get_value_type (a0) != G_TYPE_STRING)
+        return;
+      if (a1 && JSON_NODE_HOLDS_ARRAY (a1))           /* new: [user, ["user-typing"], {}] */
+        {
+          JsonArray *acts = json_node_get_array (a1);
+          for (guint i = 0; i < json_array_get_length (acts); i++)
+            if (g_strcmp0 (json_array_get_string_element (acts, i), "user-typing") == 0)
+              typing = TRUE;
+        }
+      else if (a1 && JSON_NODE_HOLDS_VALUE (a1))      /* old: [user, bool] */
+        typing = json_node_get_boolean (a1);
+      json_object_set_string_member (p, "username", json_node_get_string (a0));
+      json_object_set_boolean_member (p, "typing", typing);
+      rt_emit (self, "typing", p);
+    }
+  else if (g_str_equal (kind, "messagesRead"))
+    {
+      rt_emit (self, "messages-read", p);
+    }
 }
 
 static void
@@ -717,25 +1100,31 @@ rt_handle (RcClient   *self,
   else if (g_str_equal (msg, "result") &&
            g_strcmp0 (json_object_get_string_member_with_default (obj, "id", NULL), "login") == 0)
     {
+      g_autofree char *s1 = NULL, *s2 = NULL;
+
       if (json_object_has_member (obj, "error"))
         {
           g_warning ("Realtime login failed");
           return;
         }
-      rt_subscribe (self, "stream-room-messages", "__my_messages__");
+      self->rt_ready = TRUE;
+      s1 = rt_subscribe (self, "stream-room-messages", "__my_messages__");
       if (self->user_id)
         {
           g_autofree char *ev = g_strconcat (self->user_id, "/subscriptions-changed", NULL);
-          rt_subscribe (self, "stream-notify-user", ev);
+          s2 = rt_subscribe (self, "stream-notify-user", ev);
         }
+      g_ptr_array_set_size (self->rt_room_subs, 0);
+      rt_subscribe_room (self);
       rt_emit (self, "connected", NULL);
     }
   else if (g_str_equal (msg, "changed"))
     {
       const char *coll = json_object_get_string_member_with_default (obj, "collection", "");
-      JsonObject *fields = json_object_get_object_member (obj, "fields");
+      JsonObject *fields = json_object_has_member (obj, "fields") ? json_object_get_object_member (obj, "fields") : NULL;
       JsonArray *args = fields && json_object_has_member (fields, "args")
                         ? json_object_get_array_member (fields, "args") : NULL;
+      const char *event_name = fields ? json_object_get_string_member_with_default (fields, "eventName", "") : "";
 
       if (args == NULL)
         return;
@@ -756,6 +1145,10 @@ rt_handle (RcClient   *self,
               JSON_NODE_HOLDS_OBJECT (json_array_get_element (args, 1)))
             sub = json_array_get_object_element (args, 1);
           rt_emit (self, "subscriptions-changed", sub);
+        }
+      else if (g_str_equal (coll, "stream-notify-room"))
+        {
+          rt_handle_room_event (self, event_name, args);
         }
     }
 }
@@ -813,6 +1206,7 @@ on_ws_closed (SoupWebsocketConnection *ws,
     return;
   g_signal_handlers_disconnect_by_data (ws, self);
   g_clear_object (&self->ws);
+  self->rt_ready = FALSE;
   rt_emit (self, "disconnected", NULL);
   rt_schedule_reconnect (self);
 }
@@ -890,6 +1284,8 @@ rt_connect (RcClient *self)
   msg = soup_message_new ("GET", url);
   if (msg == NULL)
     return;
+  /* same certificate pinning as REST (self-signed servers) */
+  g_signal_connect (msg, "accept-certificate", G_CALLBACK (on_accept_certificate), self);
 
   soup_session_websocket_connect_async (self->session, msg, NULL, NULL,
                                         G_PRIORITY_DEFAULT, self->rt_cancellable,
@@ -914,9 +1310,13 @@ void
 rc_client_realtime_stop (RcClient *self)
 {
   self->rt_wanted = FALSE;
+  self->rt_ready = FALSE;
   self->rt_func = NULL;
   self->rt_data = NULL;
   g_clear_handle_id (&self->rt_reconnect_id, g_source_remove);
+  if (self->rt_room_subs)
+    g_ptr_array_set_size (self->rt_room_subs, 0);
+  g_clear_pointer (&self->rt_room, g_free);
 
   if (self->rt_cancellable)
     {

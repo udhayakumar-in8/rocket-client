@@ -17,8 +17,8 @@ Rules-Requires-Root: no
 Package: rocket-client
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
-Recommends: glib-networking
-Description: minimal Rocket.Chat messaging client
- A small GTK 4 / libadwaita client for Rocket.Chat servers, written in C.
+Recommends: glib-networking, gstreamer1.0-plugins-good
+Description: lightweight Rocket.Chat messaging client
+ A GTK 4 / libadwaita client for Rocket.Chat servers, written in C.
  It connects over HTTPS (port 443) or plain HTTP (port 80) and receives
  messages in real time over the Rocket.Chat WebSocket (DDP) API.

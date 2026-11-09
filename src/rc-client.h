@@ -1,11 +1,12 @@
 /* rc-client.h - Minimal Rocket.Chat REST + realtime (DDP over WebSocket) client
  *
  * Supports plain HTTP (port 80, ws://) and HTTPS (port 443, wss://), with an
- * "auto" mode that tries HTTPS first and falls back to HTTP.
+ * "auto" mode that tries HTTPS first and falls back to HTTP.  Self-signed /
+ * private-CA certificates can be pinned (trust on first use).
  */
 #pragma once
 
-#include <glib.h>
+#include <gio/gio.h>
 #include <json-glib/json-glib.h>
 
 G_BEGIN_DECLS
@@ -14,10 +15,12 @@ G_BEGIN_DECLS
 
 typedef enum {
   RC_CLIENT_ERROR_INVALID_URL,
-  RC_CLIENT_ERROR_HTTP,  /* non-2xx with non-JSON body */
-  RC_CLIENT_ERROR_PARSE, /* 2xx but body is not Rocket.Chat JSON */
-  RC_CLIENT_ERROR_API,   /* Rocket.Chat returned an error object */
-  RC_CLIENT_ERROR_AUTH,  /* 401: not logged in / bad token */
+  RC_CLIENT_ERROR_HTTP,           /* non-2xx with non-JSON body */
+  RC_CLIENT_ERROR_PARSE,          /* 2xx but body is not Rocket.Chat JSON */
+  RC_CLIENT_ERROR_API,            /* Rocket.Chat returned an error object */
+  RC_CLIENT_ERROR_AUTH,           /* 401: not logged in / bad token */
+  RC_CLIENT_ERROR_NOT_FOUND,      /* 404: endpoint does not exist */
+  RC_CLIENT_ERROR_UNTRUSTED_CERT, /* TLS certificate not trusted (yet) */
 } RcClientError;
 
 typedef enum {
@@ -38,14 +41,17 @@ typedef void (*RcResponseFunc) (RcClient     *client,
 
 typedef void (*RcBytesFunc) (RcClient     *client,
                              GBytes       *bytes,
+                             const char   *content_type,
                              const GError *error,
                              gpointer      user_data);
 
 /* Realtime events:
- *   "connected"             payload NULL
- *   "disconnected"          payload NULL
- *   "message"               payload = message object (new or edited)
- *   "subscriptions-changed" payload = subscription object or NULL
+ *   "connected" / "disconnected"   payload NULL
+ *   "message"                      payload = message object (new or edited)
+ *   "subscriptions-changed"        payload = subscription object or NULL
+ *   "deleted"                      payload = { "_id", "rid" }
+ *   "typing"                       payload = { "rid", "username", "typing": bool }
+ *   "messages-read"                payload = { "rid" }
  */
 typedef void (*RcRealtimeFunc) (RcClient   *client,
                                 const char *event,
@@ -58,7 +64,6 @@ gboolean    rc_error_is_cancelled      (const GError *error);
 RcClient   *rc_client_new              (void);
 RcClient   *rc_client_ref              (RcClient *client);
 void        rc_client_unref            (RcClient *client);
-/* cancel every pending request and stop realtime */
 void        rc_client_shutdown         (RcClient *client);
 
 gboolean    rc_client_set_server       (RcClient    *client,
@@ -74,15 +79,26 @@ void        rc_client_set_credentials  (RcClient   *client,
 const char *rc_client_get_user_id      (RcClient *client);
 const char *rc_client_get_token        (RcClient *client);
 
-/* POST /api/v1/login – on success credentials are stored on the client and
- * the base URL is fixed to whichever candidate (443/80) worked. */
+/* --- certificate trust ------------------------------------------------- */
+/* keyfile where pinned certificate fingerprints are stored */
+void             rc_client_set_trust_file          (RcClient   *client,
+                                                    const char *path);
+/* certificate that caused the last RC_CLIENT_ERROR_UNTRUSTED_CERT */
+GTlsCertificate *rc_client_get_rejected_certificate (RcClient             *client,
+                                                     const char          **host,
+                                                     GTlsCertificateFlags *errors);
+/* pin the rejected certificate for its host:port and persist it */
+void             rc_client_trust_rejected_certificate (RcClient *client);
+char            *rc_cert_fingerprint               (GTlsCertificate *cert);
+char            *rc_cert_describe_errors           (GTlsCertificateFlags errors);
+
+/* --- REST ---------------------------------------------------------------- */
 void        rc_client_login            (RcClient      *client,
                                         const char    *user,
                                         const char    *password,
                                         const char    *totp_code,
                                         RcResponseFunc func,
                                         gpointer       user_data);
-
 void        rc_client_get              (RcClient      *client,
                                         const char    *path,
                                         RcResponseFunc func,
@@ -93,14 +109,33 @@ void        rc_client_post             (RcClient      *client,
                                         JsonNode      *body,
                                         RcResponseFunc func,
                                         gpointer       user_data);
+/* multipart/form-data upload; @fields is a NULL-terminated key,value list */
+void        rc_client_upload           (RcClient           *client,
+                                        const char         *path,
+                                        const char         *filename,
+                                        const char         *content_type,
+                                        GBytes             *data,
+                                        const char * const *fields,
+                                        RcResponseFunc      func,
+                                        gpointer            user_data);
+/* @path may be server-relative ("/file-upload/…") or an absolute URL;
+ * auth headers are only sent to the Rocket.Chat server itself. */
 void        rc_client_fetch_bytes      (RcClient    *client,
                                         const char  *path,
                                         RcBytesFunc  func,
                                         gpointer     user_data);
 
+/* --- realtime ------------------------------------------------------------ */
 void        rc_client_realtime_start   (RcClient       *client,
                                         RcRealtimeFunc  func,
                                         gpointer        user_data);
 void        rc_client_realtime_stop    (RcClient *client);
+/* follow per-room events (deletes, typing, read) for @rid (NULL = none) */
+void        rc_client_realtime_watch_room (RcClient   *client,
+                                           const char *rid);
+void        rc_client_realtime_typing  (RcClient   *client,
+                                        const char *rid,
+                                        const char *username,
+                                        gboolean    typing);
 
 G_END_DECLS

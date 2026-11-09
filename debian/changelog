@@ -1,3 +1,12 @@
+rocket-client (0.2.0) unstable; urgency=medium
+
+  * Trust self-signed certificates (fingerprint pinning).
+  * Emoji picker, reactions, threads, edit/delete/pin/star, typing indicator.
+  * File uploads, inline diff/text/image previews and a preview column.
+  * Read receipts, tasks, timers/reminders and calendar.
+
+ -- Udhayakumar <udhayazm1@gmail.com>  Mon, 09 Nov 2026 12:00:00 +0000
+
 rocket-client (0.1.0) unstable; urgency=medium
 
   * Initial release.

@@ -1,5 +1,5 @@
 project('rocket-client', 'c',
-  version: '0.1.0',
+  version: '0.2.0',
   license: 'MIT',
   meson_version: '>= 0.62',
   default_options: ['warning_level=2', 'c_std=gnu11'])
@@ -26,7 +26,8 @@ conf.set_quoted('APP_VERSION', meson.project_version())
 configure_file(output: 'config.h', configuration: conf)
 
 executable('rocket-client',
-  ['src/main.c', 'src/rc-client.c', 'src/rc-window.c'],
+  ['src/main.c', 'src/rc-client.c', 'src/rc-window.c', 'src/rc-emoji.c',
+   'src/rc-preview.c', 'src/rc-planner.c'],
   dependencies: deps,
   include_directories: include_directories('.'),
   install: true)
@@ -41,3 +42,9 @@ test_client = executable('test-client',
   dependencies: [dependency('libsoup-3.0'), dependency('json-glib-1.0')],
   include_directories: include_directories('.'))
 test('client', test_client, env: ['no_proxy=*', 'NO_PROXY=*'])
+
+test_misc = executable('test-misc',
+  ['tests/test-misc.c', 'src/rc-emoji.c', 'src/rc-preview.c', 'src/rc-client.c'],
+  dependencies: deps,
+  include_directories: include_directories('.'))
+test('misc', test_misc)
